@@ -1,0 +1,121 @@
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters, CallbackContext
+import sqlite3
+import requests
+import json
+from cryptography.fernet import Fernet
+
+# Setup the SQLite database connection
+conn = sqlite3.connect('wallets.db')
+c = conn.cursor()
+
+# Initialize Updater
+updater = Updater('YOUR_BOT_API_KEY', use_context=True)
+
+# Encryption setup
+ENCRYPTION_KEY = b'YOUR_ENCRYPTION_KEY'  # Ensure this is securely stored
+cipher = Fernet(ENCRYPTION_KEY)
+
+# --- General Function "Homepage" Buttons ---
+async def homepage_command(update: Update, context: CallbackContext):
+    keyboard = [
+        [InlineKeyboardButton("Bundler", callback_data="bundler")],
+        [InlineKeyboardButton("Multi Snipe", callback_data="multi_snipe")],
+        [InlineKeyboardButton("Check Wallet Balances", callback_data="check_balances")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Select an option:", reply_markup=reply_markup)
+
+async def bundler_command(update: Update, context: CallbackContext):
+    keyboard = [
+        [InlineKeyboardButton("Generate Wallets", callback_data="generate_wallets")],
+        [InlineKeyboardButton("Fund Wallets", callback_data="fund_wallets")],
+        [InlineKeyboardButton("Create Token", callback_data="create_token")],
+        [InlineKeyboardButton("Dump All", callback_data="dump_all")],
+        [InlineKeyboardButton("Sell", callback_data="sell")],
+        [InlineKeyboardButton("Retrieve P-Keys", callback_data="retrieve_p_keys")],
+        [InlineKeyboardButton("Check Balances", callback_data="check_balances")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Bundler Menu:", reply_markup=reply_markup)
+
+async def multi_snipe_command(update: Update, context: CallbackContext):
+    keyboard = [
+        [InlineKeyboardButton("Generate Wallets", callback_data="generate_wallets")],
+        [InlineKeyboardButton("Fund Wallets", callback_data="fund_wallets")],
+        [InlineKeyboardButton("Paste Token Address", callback_data="paste_token_address")],
+        [InlineKeyboardButton("Buy", callback_data="buy")],
+        [InlineKeyboardButton("Sell", callback_data="sell")],
+        [InlineKeyboardButton("Dump All", callback_data="dump_all")],
+        [InlineKeyboardButton("Retrieve P-Keys", callback_data="retrieve_p_keys")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Multi-Snipe Menu:", reply_markup=reply_markup)
+
+# --- Securely Store Private Keys on a Remote Server ---
+def store_private_key(wallet_address, private_key, category):
+    encrypted_key = cipher.encrypt(private_key.encode()).decode()
+    data = {"wallet_address": wallet_address, "encrypted_private_key": encrypted_key, "category": category}
+    requests.post("https://your-secure-server.com/store_key", json=data)
+
+# --- Token Creation with Pump.fun API Integration ---
+async def create_token_command(update: Update, context: CallbackContext):
+    await update.message.reply_text("Enter token name:")
+    context.user_data["awaiting_token_name"] = True
+
+async def process_token_details(update: Update, context: CallbackContext):
+    user_input = update.message.text
+    user_data = context.user_data
+    
+    if "awaiting_token_name" in user_data:
+        user_data["token_name"] = user_input
+        del user_data["awaiting_token_name"]
+        await update.message.reply_text("Enter token symbol:")
+        user_data["awaiting_token_symbol"] = True
+    elif "awaiting_token_symbol" in user_data:
+        user_data["token_symbol"] = user_input
+        del user_data["awaiting_token_symbol"]
+        await update.message.reply_text("Enter supply:")
+        user_data["awaiting_supply"] = True
+    elif "awaiting_supply" in user_data:
+        user_data["supply"] = user_input
+        del user_data["awaiting_supply"]
+        await update.message.reply_text("Enter decimals:")
+        user_data["awaiting_decimals"] = True
+    elif "awaiting_decimals" in user_data:
+        user_data["decimals"] = user_input
+        del user_data["awaiting_decimals"]
+        await update.message.reply_text("Enter website (or type 'none'):")
+        user_data["awaiting_website"] = True
+    elif "awaiting_website" in user_data:
+        user_data["website"] = user_input
+        del user_data["awaiting_website"]
+        await update.message.reply_text("Enter Telegram (or type 'none'):")
+        user_data["awaiting_telegram"] = True
+    elif "awaiting_telegram" in user_data:
+        user_data["telegram"] = user_input
+        del user_data["awaiting_telegram"]
+        await update.message.reply_text("Enter Twitter (or type 'none'):")
+        user_data["awaiting_twitter"] = True
+    elif "awaiting_twitter" in user_data:
+        user_data["twitter"] = user_input
+        del user_data["awaiting_twitter"]
+        
+        response = requests.post("https://pump.fun/api/create_token", json=user_data)
+        
+        if response.status_code == 200:
+            await update.message.reply_text("Token successfully created!")
+        else:
+            await update.message.reply_text("Failed to create token. Please try again.")
+        
+        user_data.clear()
+
+# --- Register Handlers ---
+updater.dispatcher.add_handler(CommandHandler('homepage', homepage_command))
+updater.dispatcher.add_handler(CommandHandler('bundler', bundler_command))
+updater.dispatcher.add_handler(CommandHandler('multi_snipe', multi_snipe_command))
+updater.dispatcher.add_handler(CommandHandler('create_token', create_token_command))
+updater.dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, process_token_details))
+
+updater.start_polling()
+updater.idle()
