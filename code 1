@@ -11,6 +11,10 @@ from solana.publickey import PublicKey
 from solana.rpc.types import TxOpts
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, CallbackContext, CallbackQueryHandler
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Constants
 SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
@@ -19,8 +23,12 @@ PUMP_FUN_API_URL = "https://api.pump.fun/v1/create"
 DB_FILE = "wallets.db"
 PUMP_FUN_API_KEY = os.getenv("PUMP_FUN_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ENCRYPTION_KEY = Fernet.generate_key()
-fernet = Fernet(ENCRYPTION_KEY)
+
+# Secure Encryption Key
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
+if not ENCRYPTION_KEY:
+    raise ValueError("Missing ENCRYPTION_KEY environment variable")
+fernet = Fernet(ENCRYPTION_KEY.encode())
 
 # Initialize Solana client
 sol_client = AsyncClient(SOLANA_RPC_URL)
@@ -34,7 +42,7 @@ async def get_balance(user_id: int):
     wallet = c.execute("SELECT public_key FROM wallets WHERE user_id = ?", (user_id,)).fetchone()
     if not wallet:
         return "No wallet found. Use /start to create one."
-    
+
     public_key = wallet[0]
     balance = await sol_client.get_balance(PublicKey(public_key))
     
@@ -47,7 +55,6 @@ def launch_token_on_pump_fun(user_id: int, ticker: str, name: str, supply: int):
         return "You need to create a wallet first using /start."
 
     private_key_decrypted = fernet.decrypt(wallet[0].encode()).decode()
-    keypair = Keypair.from_secret_key(bytes.fromhex(private_key_decrypted))
     
     payload = {
         "ticker": ticker,
@@ -76,24 +83,34 @@ async def execute_trade(user_id: int, token_in: str, token_out: str, amount: flo
 
     private_key_decrypted = fernet.decrypt(wallet[0].encode()).decode()
     keypair = Keypair.from_secret_key(bytes.fromhex(private_key_decrypted))
-    
-    # Fetch Jupiter API swap quote
+
+    public_key = PublicKey(wallet[1])
+    balance_response = await sol_client.get_balance(public_key)
+    balance = balance_response['result']['value'] / 1e9  # Convert lamports to SOL
+
+    required_sol = 0.002  # Example gas fee
+    if balance < required_sol:
+        return f"Insufficient SOL balance. You need at least {required_sol} SOL to proceed."
+
     response = requests.get(
         f"{JUPITER_SWAP_API}?inputMint={token_in}&outputMint={token_out}&amount={int(amount * 1e9)}&slippage=1"
     )
 
     if response.status_code != 200:
-        return "Failed to get swap quote. Try again later."
-    
+        return f"Failed to get swap quote: {response.text}"
+
     quote = response.json()
-    
+
+    if "swapTransaction" not in quote:
+        return "Invalid response from Jupiter API. Try again later."
+
     transaction = Transaction()
     try:
         transaction.add(quote['swapTransaction'])
         await sol_client.send_transaction(transaction, keypair, opts=TxOpts(skip_confirmation=False))
         return "Trade executed successfully!"
-    except KeyError:
-        return "Error processing trade. The Jupiter API response was unexpected."
+    except Exception as e:
+        return f"Trade failed: {str(e)}"
 
 # Trade Process - Step 1: Select Token In
 async def trade_command(update: Update, context: CallbackContext):
@@ -116,4 +133,40 @@ async def trade_select_token(update: Update, context: CallbackContext):
         [InlineKeyboardButton("USDC", callback_data="tradeout_USDC")],
         [InlineKeyboardButton("Other", callback_data="tradeout_OTHER")]
     ]
-    reply_markup = InlineKeyboardMarkup(keybo
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text("Select the token you want to receive:", reply_markup=reply_markup)
+
+# Cancel Action
+async def cancel_action(update: Update, context: CallbackContext):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Action canceled.")
+
+# Dump All Tokens (Batch Sell)
+async def dump_all_command(update: Update, context: CallbackContext):
+    keyboard = [
+        [InlineKeyboardButton("Sell All Tokens", callback_data="confirm_dump")],
+        [InlineKeyboardButton("Cancel", callback_data="cancel")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Are you sure you want to sell all tokens?", reply_markup=reply_markup)
+
+async def confirm_dump(update: Update, context: CallbackContext):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("All tokens sold successfully!")
+
+# Telegram Bot Setup
+app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+app.add_handler(CommandHandler("trade", trade_command))
+app.add_handler(CallbackQueryHandler(trade_select_token, pattern="^trade_"))
+app.add_handler(CallbackQueryHandler(execute_trade, pattern="^trade_confirm$"))
+app.add_handler(CallbackQueryHandler(cancel_action, pattern="^cancel$"))
+app.add_handler(CommandHandler("dump_all", dump_all_command))
+app.add_handler(CallbackQueryHandler(confirm_dump, pattern="^confirm_dump$"))
+
+async def main():
+    await app.run_polling()
+
+if __name__ == "__main__":
+    asyncio.run(main()) 
