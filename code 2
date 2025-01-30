@@ -117,5 +117,6 @@ updater.dispatcher.add_handler(CommandHandler('multi_snipe', multi_snipe_command
 updater.dispatcher.add_handler(CommandHandler('create_token', create_token_command))
 updater.dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, process_token_details))
 
+# Start polling
 updater.start_polling()
 updater.idle()
