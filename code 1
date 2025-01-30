@@ -1,0 +1,119 @@
+import asyncio
+import json
+import sqlite3
+import requests
+import os
+from cryptography.fernet import Fernet
+from solana.rpc.async_api import AsyncClient
+from solana.keypair import Keypair
+from solana.transaction import Transaction
+from solana.publickey import PublicKey
+from solana.rpc.types import TxOpts
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import Application, CommandHandler, CallbackContext, CallbackQueryHandler
+
+# Constants
+SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
+JUPITER_SWAP_API = "https://quote-api.jup.ag/v4/swap"
+PUMP_FUN_API_URL = "https://api.pump.fun/v1/create"
+DB_FILE = "wallets.db"
+PUMP_FUN_API_KEY = os.getenv("PUMP_FUN_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+ENCRYPTION_KEY = Fernet.generate_key()
+fernet = Fernet(ENCRYPTION_KEY)
+
+# Initialize Solana client
+sol_client = AsyncClient(SOLANA_RPC_URL)
+
+# Database Connection
+conn = sqlite3.connect(DB_FILE)
+c = conn.cursor()
+
+# Function to fetch real-time Solana balance
+async def get_balance(user_id: int):
+    wallet = c.execute("SELECT public_key FROM wallets WHERE user_id = ?", (user_id,)).fetchone()
+    if not wallet:
+        return "No wallet found. Use /start to create one."
+    
+    public_key = wallet[0]
+    balance = await sol_client.get_balance(PublicKey(public_key))
+    
+    return f"Your balance: {balance['result']['value'] / 1e9} SOL"
+
+# Function to launch a token via Pump.fun API
+def launch_token_on_pump_fun(user_id: int, ticker: str, name: str, supply: int):
+    wallet = c.execute("SELECT private_key, public_key FROM wallets WHERE user_id = ?", (user_id,)).fetchone()
+    if not wallet:
+        return "You need to create a wallet first using /start."
+
+    private_key_decrypted = fernet.decrypt(wallet[0].encode()).decode()
+    keypair = Keypair.from_secret_key(bytes.fromhex(private_key_decrypted))
+    
+    payload = {
+        "ticker": ticker,
+        "name": name,
+        "supply": supply,
+        "creator": wallet[1]
+    }
+
+    headers = {"Authorization": f"Bearer {PUMP_FUN_API_KEY}", "Content-Type": "application/json"}
+    response = requests.post(PUMP_FUN_API_URL, json=payload, headers=headers)
+
+    if response.status_code == 200:
+        mint_address = response.json().get("mint_address")
+        c.execute("INSERT INTO tokens (user_id, mint_address, ticker, name, supply) VALUES (?, ?, ?, ?, ?)",
+                  (user_id, mint_address, ticker, name, supply))
+        conn.commit()
+        return f"Token {ticker} launched successfully! Mint Address: {mint_address}"
+    else:
+        return f"Failed to launch token: {response.text}"
+
+# Function to execute a trade via Jupiter Aggregator
+async def execute_trade(user_id: int, token_in: str, token_out: str, amount: float):
+    wallet = c.execute("SELECT private_key, public_key FROM wallets WHERE user_id = ?", (user_id,)).fetchone()
+    if not wallet:
+        return "You need to generate a wallet first using /start."
+
+    private_key_decrypted = fernet.decrypt(wallet[0].encode()).decode()
+    keypair = Keypair.from_secret_key(bytes.fromhex(private_key_decrypted))
+    
+    # Fetch Jupiter API swap quote
+    response = requests.get(
+        f"{JUPITER_SWAP_API}?inputMint={token_in}&outputMint={token_out}&amount={int(amount * 1e9)}&slippage=1"
+    )
+
+    if response.status_code != 200:
+        return "Failed to get swap quote. Try again later."
+    
+    quote = response.json()
+    
+    transaction = Transaction()
+    try:
+        transaction.add(quote['swapTransaction'])
+        await sol_client.send_transaction(transaction, keypair, opts=TxOpts(skip_confirmation=False))
+        return "Trade executed successfully!"
+    except KeyError:
+        return "Error processing trade. The Jupiter API response was unexpected."
+
+# Trade Process - Step 1: Select Token In
+async def trade_command(update: Update, context: CallbackContext):
+    keyboard = [
+        [InlineKeyboardButton("SOL", callback_data="trade_SOL")],
+        [InlineKeyboardButton("USDC", callback_data="trade_USDC")],
+        [InlineKeyboardButton("Other", callback_data="trade_OTHER")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Select the token you want to trade:", reply_markup=reply_markup)
+
+# Trade Process - Step 2: Select Token Out
+async def trade_select_token(update: Update, context: CallbackContext):
+    query = update.callback_query
+    context.user_data["trade_token_in"] = query.data.split("_")[1]
+    await query.answer()
+
+    keyboard = [
+        [InlineKeyboardButton("SOL", callback_data="tradeout_SOL")],
+        [InlineKeyboardButton("USDC", callback_data="tradeout_USDC")],
+        [InlineKeyboardButton("Other", callback_data="tradeout_OTHER")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keybo
